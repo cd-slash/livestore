@@ -940,13 +940,499 @@ These components are inherently provider-specific:
 
 ### Step 3: Design Storage
 
-**Questions**:
-1. What data store? (SQL, NoSQL, object storage, stream service)
-2. How to track head? (column, metadata table, service-managed)
-3. How to query by cursor? (indexed column, range queries, stream API)
-4. How to ensure atomicity? (transactions, locks, service guarantees)
+This step involves making specific decisions about how your sync server will persist and query events.
+
+#### 3.1: Choose Data Store
+
+**Options**:
+- **SQL Database** (PostgreSQL, MySQL, SQLite): Best for queryability, ACID guarantees
+- **NoSQL** (DynamoDB, MongoDB): Good for scalability, flexible schema
+- **Object Storage** (S3, R2): Cheapest for large volumes, higher latency
+- **Stream Service** (S2, Kafka, Kinesis): Built for event streaming, sequential access only
+
+**Example schemas**:
+
+```sql
+-- SQL approach (like Cloudflare DO SQLite)
+CREATE TABLE eventlog_v6_mystore (
+  seqNum INTEGER PRIMARY KEY,      -- Ensures uniqueness, enables fast lookups
+  parentSeqNum INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  args TEXT,                       -- JSON-encoded
+  clientId TEXT NOT NULL,
+  sessionId TEXT NOT NULL,
+  createdAt TEXT NOT NULL
+);
+
+-- Metadata table for head tracking
+CREATE TABLE context_v6 (
+  storeId TEXT PRIMARY KEY,
+  currentHead INTEGER NOT NULL,
+  backendId TEXT NOT NULL,
+  updatedAt TEXT NOT NULL
+);
+```
+
+#### 3.2: Design Head Tracking
+
+The "head" is the sequence number of the latest event in the store. It's critical for push validation.
+
+**Decision: Where to store head?**
+
+**Option A: Separate metadata table** (Cloudflare approach)
+```typescript
+// Pros: Clean separation, easy to query, supports multiple stores in one DB
+// Cons: Requires separate update, potential for inconsistency
+{
+  storeId: "myStore",
+  currentHead: 42,
+  backendId: "abc123",
+  updatedAt: "2025-11-14T10:30:00Z"
+}
+```
+
+**Option B: In-memory with persistence**
+```typescript
+// Pros: Fast reads, no DB query needed
+// Cons: Lost on restart (need to recompute), harder to scale
+let currentHead = 42  // Recomputed on startup: SELECT MAX(seqNum) FROM eventlog
+```
+
+**Option C: Derived from events table**
+```typescript
+// Pros: Always consistent, no separate updates needed
+// Cons: Slower (needs query on every push), doesn't support backendId
+SELECT MAX(seqNum) FROM eventlog WHERE storeId = ?
+```
+
+**Recommendation**: Use separate metadata table for production (Option A). It's the most robust and supports backendId validation.
+
+**Decision: What to include?**
+
+**Minimum**:
+- `currentHead` (number): Latest sequence number
+
+**Recommended**:
+- `backendId` (string): Prevents cross-backend pulls after migration
+- `updatedAt` (timestamp): For debugging and monitoring
+- `storeId` (string): If supporting multiple stores in one DB
+
+**Decision: How to update?**
+
+**Option A: Same transaction as events** (Recommended)
+```typescript
+await db.transaction(async (tx) => {
+  // Insert events
+  await tx.insert(eventlog).values(events)
+
+  // Update head in same transaction
+  await tx.update(context)
+    .set({ currentHead: lastEvent.seqNum })
+    .where(eq(context.storeId, storeId))
+})
+// Pros: Atomic, always consistent
+// Cons: Slightly more complex
+```
+
+**Option B: Separate update**
+```typescript
+await db.insert(eventlog).values(events)
+await db.update(context).set({ currentHead: lastEvent.seqNum })
+// Pros: Simpler
+// Cons: Risk of inconsistency if second update fails
+```
+
+**Recommendation**: Use same transaction (Option A) for strong consistency.
+
+#### 3.3: Design Cursor-Based Queries
+
+Cursors track where a client left off in the event stream. Your server must efficiently query events starting from a cursor.
+
+**Decision: Index strategy?**
+
+**Option A: Primary key on seqNum** (Recommended)
+```sql
+CREATE TABLE eventlog (
+  seqNum INTEGER PRIMARY KEY,  -- Clustered index, very fast
+  ...
+);
+
+-- Query is efficient: O(log n) seek + O(k) scan
+SELECT * FROM eventlog
+WHERE seqNum > ?      -- Cursor position
+ORDER BY seqNum ASC
+LIMIT 100;
+```
+- **Pros**: Fastest queries, no additional index needed
+- **Cons**: Requires seqNum uniqueness (which we already need)
+
+**Option B: Composite index**
+```sql
+CREATE TABLE eventlog (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  storeId TEXT NOT NULL,
+  seqNum INTEGER NOT NULL,
+  ...
+);
+
+CREATE INDEX idx_store_seq ON eventlog(storeId, seqNum);
+
+-- Query uses composite index
+SELECT * FROM eventlog
+WHERE storeId = ? AND seqNum > ?
+ORDER BY seqNum ASC
+LIMIT 100;
+```
+- **Pros**: Supports multiple stores in same table
+- **Cons**: Additional index overhead, slightly slower
+
+**Option C: Sequential scan** (Not recommended for production)
+```sql
+-- No index, just scan
+SELECT * FROM eventlog
+WHERE seqNum > ?
+ORDER BY seqNum ASC;
+```
+- **Pros**: No index maintenance
+- **Cons**: Slow for large datasets (O(n) scan)
+
+**Recommendation**: Primary key on seqNum (Option A) for single-store tables, composite index (Option B) for multi-store.
+
+**Decision: Query pattern?**
+
+**Option A: Limit-based pagination**
+```typescript
+const events = await db.query(
+  `SELECT * FROM eventlog
+   WHERE seqNum > $1
+   ORDER BY seqNum ASC
+   LIMIT $2`,
+  [cursor, pageSize]
+)
+```
+- **Pros**: Simple, predictable page size
+- **Cons**: Doesn't handle "get all remaining" efficiently
+
+**Option B: Size-based chunking**
+```typescript
+let chunk = []
+let totalBytes = 0
+for await (const event of queryStream(cursor)) {
+  chunk.push(event)
+  totalBytes += estimateSize(event)
+
+  if (totalBytes >= MAX_BYTES || chunk.length >= MAX_COUNT) {
+    yield chunk
+    chunk = []
+    totalBytes = 0
+  }
+}
+```
+- **Pros**: Respects transport limits (WebSocket message size, etc.)
+- **Cons**: More complex, variable page size
+
+**Recommendation**: Use limit-based for simplicity (Option A). Add size-based chunking (Option B) if needed for transport constraints.
+
+**Decision: Ordering guarantee?**
+
+**Option A: Implicit from storage**
+```typescript
+// If using stream service like S2
+const records = await s2.read(stream, { seqNum: cursor })
+// Order guaranteed by service
+```
+
+**Option B: Explicit ORDER BY**
+```sql
+SELECT * FROM eventlog
+WHERE seqNum > ?
+ORDER BY seqNum ASC  -- Explicit ordering
+```
+
+**Recommendation**: Always use explicit ORDER BY for SQL databases. Rely on service guarantees for stream services.
+
+#### 3.4: Design Atomicity Guarantees
+
+Push operations must be atomic to prevent race conditions and maintain event order.
+
+**Decision: Atomicity mechanism?**
+
+**Option A: Database transactions** (PostgreSQL, MySQL)
+```typescript
+await db.transaction(async (tx) => {
+  // 1. Read current head
+  const { currentHead } = await tx.query('SELECT currentHead FROM context WHERE storeId = ?', [storeId])
+
+  // 2. Validate
+  if (batch[0].parentSeqNum !== currentHead) {
+    throw new ServerAheadError()
+  }
+
+  // 3. Write events
+  await tx.insert(eventlog).values(batch)
+
+  // 4. Update head
+  await tx.update(context).set({ currentHead: batch[batch.length - 1].seqNum })
+})
+// Pros: Standard, well-understood, ACID guarantees
+// Cons: Requires transaction support, slower than locks
+```
+
+**Option B: Explicit locks** (Cloudflare Durable Objects)
+```typescript
+await storage.blockConcurrencyWhile(async () => {
+  // Only one push can execute at a time for this storeId
+  const currentHead = getCurrentHead()
+  validate(batch, currentHead)
+  await persistEvents(batch)
+  setHead(batch[batch.length - 1].seqNum)
+})
+// Pros: Fast, simple, guaranteed serialization
+// Cons: Platform-specific (DO feature)
+```
+
+**Option C: Compare-and-swap** (DynamoDB, Redis)
+```typescript
+// DynamoDB conditional update
+await dynamodb.put({
+  TableName: 'context',
+  Item: { storeId, currentHead: newHead },
+  ConditionExpression: 'currentHead = :expectedHead',
+  ExpressionAttributeValues: { ':expectedHead': oldHead }
+})
+// If condition fails, another process updated head -> retry
+// Pros: Optimistic concurrency, scales well
+// Cons: Requires retry logic, more complex
+```
+
+**Option D: Service guarantees** (S2, Kafka)
+```typescript
+// S2 guarantees sequential appends within a stream
+await s2.append(stream, { records: batch })
+// S2 assigns seq_nums sequentially, no explicit locking needed
+// Pros: Simple, managed by service
+// Cons: Requires external service, less control
+```
+
+**Option E: Application-level locking** (Redis, in-memory)
+```typescript
+// Acquire distributed lock
+const lock = await redis.lock(`push:${storeId}`, { timeout: 5000 })
+try {
+  const currentHead = await getHead(storeId)
+  validate(batch, currentHead)
+  await persistEvents(batch)
+  await setHead(batch[batch.length - 1].seqNum)
+} finally {
+  await lock.unlock()
+}
+// Pros: Works with any storage backend
+// Cons: Additional infrastructure (Redis), failure handling complex
+```
+
+**Recommendation by storage type**:
+- **SQL databases**: Use transactions (Option A)
+- **Cloudflare/Durable Objects**: Use `blockConcurrencyWhile` (Option B)
+- **DynamoDB/NoSQL**: Use compare-and-swap (Option C)
+- **Stream services**: Rely on service guarantees (Option D)
+- **Other**: Use application-level locking (Option E)
+
+**Decision: Isolation level?**
+
+For SQL transactions:
+
+**Option A: SERIALIZABLE**
+```sql
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+BEGIN;
+  -- Read + write operations
+COMMIT;
+```
+- **Pros**: Strongest guarantee, prevents all anomalies
+- **Cons**: Slowest, highest contention
+
+**Option B: REPEATABLE READ**
+```sql
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+```
+- **Pros**: Prevents phantom reads, good balance
+- **Cons**: Still some contention possible
+
+**Option C: READ COMMITTED** (PostgreSQL default)
+```sql
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+```
+- **Pros**: Good performance, low contention
+- **Cons**: Phantom reads possible (okay for our use case with proper validation)
+
+**Recommendation**: READ COMMITTED is sufficient. Push validation (checking parentSeqNum matches currentHead) provides the necessary consistency guarantee without needing SERIALIZABLE.
+
+**Decision: Failure handling?**
+
+**Option A: Automatic retry**
+```typescript
+async function pushWithRetry(batch) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await atomicPush(batch)
+    } catch (error) {
+      if (error instanceof ConflictError && attempt < 2) {
+        await sleep(100 * Math.pow(2, attempt))  // Exponential backoff
+        continue
+      }
+      throw error
+    }
+  }
+}
+```
+- **Use for**: Transient failures (deadlocks, network errors)
+- **Don't use for**: Validation failures (ServerAheadError)
+
+**Option B: Explicit rollback**
+```typescript
+try {
+  await db.transaction(async (tx) => {
+    // ... operations
+  })
+} catch (error) {
+  // Transaction automatically rolled back
+  // Just propagate error to client
+  throw new InvalidPushError({ cause: error })
+}
+```
+- **Use for**: All SQL transactions (automatic)
+
+**Recommendation**: Combine both - automatic rollback (implicit in transactions) + retry for transient failures.
 
 ### Step 4: Implement Client
+
+**IMPORTANT: For full servers, you can reuse the Cloudflare client!**
+
+If you're building a custom sync server (not a client adapter to an external service), you should **implement the Cloudflare RPC protocol** server-side and **reuse the existing Cloudflare client** client-side.
+
+#### Option A: Reuse Cloudflare Client (Recommended for Full Servers)
+
+**Server requirements**:
+
+Your custom server must implement the Cloudflare RPC protocol:
+
+1. **Accept messages** defined in `@livestore/sync-cf/src/common/sync-message-types.ts`:
+   - `PullRequest`: `{ cursor: Option<{ backendId, eventSequenceNumber }> }`
+   - `PushRequest`: `{ batch: LiveStoreEvent[], backendId: Option<string> }`
+   - `Ping`: `{}`
+
+2. **Return responses** in the same format:
+   - `PullResponse`: `{ batch: Array<{ eventEncoded, metadata }>, pageInfo, backendId }`
+   - `PushAck`: `{}`
+   - `Pong`: `{}`
+
+3. **Support at least one transport**:
+   - **HTTP RPC** (`SyncHttpRpc`): Request/response pattern
+   - **WebSocket RPC** (`SyncWsRpc`): Persistent connection with streaming
+
+4. **Use simple cursor format**:
+   ```typescript
+   type CloudflareCursor = {
+     backendId: string,              // Your server's unique ID
+     eventSequenceNumber: number     // Last seen seqNum
+   }
+   ```
+
+**Client usage** (no custom code needed):
+
+```typescript
+import { makeHttpSync } from '@livestore/sync-cf/client'
+// or: import { makeWsSync } from '@livestore/sync-cf/client'
+
+// Just point to your custom server!
+const syncBackend = makeHttpSync({
+  url: 'https://my-custom-sync-server.com/sync',
+  headers: {
+    'Authorization': 'Bearer my-token'  // Your custom auth
+  }
+})
+
+const adapter = makeAdapter({
+  sync: {
+    backend: syncBackend
+  }
+})
+```
+
+**Benefits**:
+- ✅ **No client code to write** - Reuse battle-tested implementation
+- ✅ **All transport options** - HTTP, WebSocket, or both
+- ✅ **Built-in features** - Connection management, error handling, retry logic
+- ✅ **Type safety** - Effect Schema validation
+- ✅ **Observability** - Built-in tracing spans
+
+**Server implementation example**:
+
+```typescript
+// Your custom server (Node.js, Deno, Bun, etc.)
+import express from 'express'
+import { RpcServer } from '@effect/rpc'
+import { SyncHttpRpc } from '@livestore/sync-cf/common'
+
+const app = express()
+
+// Implement HTTP RPC endpoint
+app.all('/sync', async (req, res) => {
+  const handler = RpcServer.handler(SyncHttpRpc, {
+    // Implement Pull
+    'SyncHttpRpc.Pull': ({ storeId, cursor, payload }) =>
+      Effect.gen(function* () {
+        // Your custom storage logic
+        const events = yield* queryEvents(storeId, cursor?.eventSequenceNumber)
+        const backendId = yield* getBackendId()
+
+        return {
+          batch: events.map(e => ({
+            eventEncoded: e,
+            metadata: Option.some({ createdAt: e.createdAt })
+          })),
+          pageInfo: events.length > 0
+            ? { _tag: 'MoreUnknown' }
+            : { _tag: 'NoMore' },
+          backendId
+        }
+      }),
+
+    // Implement Push
+    'SyncHttpRpc.Push': ({ storeId, batch, backendId }) =>
+      Effect.gen(function* () {
+        // Your custom validation + persistence logic
+        yield* validateAndPersist(storeId, batch)
+        return {}  // PushAck
+      }),
+
+    // Implement Ping
+    'SyncHttpRpc.Ping': ({ storeId, payload }) =>
+      Effect.succeed({})  // Pong
+  })
+
+  // Handle request
+  await Effect.runPromise(handler(req, res))
+})
+
+app.listen(3000)
+```
+
+**When to use this approach**:
+- Building a custom full server (not integrating with external service)
+- Want production-ready client without writing client code
+- Need HTTP and/or WebSocket support
+- Want to focus on server-side storage/logic only
+
+#### Option B: Build Custom Client (Only When Necessary)
+
+**When you must build a custom client**:
+- Integrating with external service (like ElectricSQL, S2)
+- Need fundamentally different protocol (not RPC-based)
+- External service has its own client requirements
+- Custom transport needs (e.g., gRPC, custom WebSocket protocol)
+
+**If building custom client**, use reusable components
 
 **Use reusable components**:
 ```typescript
@@ -984,9 +1470,11 @@ export const makeSyncBackend = (options: MyOptions): SyncBackendConstructor =>
   })
 ```
 
-### Step 5: Implement Server (if full server)
+### Step 5: Implement Server (if building full server)
 
-**Minimum requirements**:
+**Note**: If you chose to reuse the Cloudflare client (Step 4, Option A), implement the server to match the RPC protocol as shown in the example above. Otherwise, implement your custom protocol.
+
+**Minimum server requirements** (generic approach):
 
 1. **Push handler**:
    ```typescript
@@ -995,7 +1483,7 @@ export const makeSyncBackend = (options: MyOptions): SyncBackendConstructor =>
      const validation = validatePushBatch(request.batch, currentHead)
      if (!validation.valid) return error(validation.error)
 
-     // ❌ Custom: Atomic write
+     // ❌ Custom: Atomic write (using decision from Step 3.4)
      await atomicWrite(() => {
        const head = getHead(request.storeId)
        if (request.batch[0].parentSeqNum !== head) {
@@ -1019,7 +1507,7 @@ export const makeSyncBackend = (options: MyOptions): SyncBackendConstructor =>
      // ❌ Custom: Cursor validation
      validateCursor(request.cursor)
 
-     // ❌ Custom: Query storage
+     // ❌ Custom: Query storage (using decision from Step 3.3)
      const events = queryEvents(request.storeId, request.cursor)
 
      // ✅ Reuse: Response format
@@ -1033,15 +1521,35 @@ export const makeSyncBackend = (options: MyOptions): SyncBackendConstructor =>
    }
    ```
 
+## Quick Decision Summary
+
+| Decision Point | Recommended Choice | Why |
+|----------------|-------------------|-----|
+| **Architecture** | Full server if need control; Adapter if using external service | Control vs convenience trade-off |
+| **Client** | Reuse Cloudflare client for full servers | No client code to write |
+| **Transport** | HTTP RPC or WebSocket RPC (for Cloudflare client) | Standard, well-tested |
+| **Storage** | SQL with transactions | ACID guarantees, queryable |
+| **Head tracking** | Separate metadata table | Robust, supports backendId |
+| **Cursor queries** | Primary key on seqNum | Fastest, simplest |
+| **Atomicity** | Database transactions | Standard, reliable |
+| **Isolation** | READ COMMITTED | Good balance of performance and safety |
+
 ## Key Recommendations
 
 ### For Custom Full Server
 
-1. **Start with Cloudflare implementation** as reference
-2. **Reuse**: Connection management, validation logic, message schemas
-3. **Focus on**: Storage backend, concurrency control, broadcasting
-4. **Consider**: Durable Objects / Fly Machines / Cloudflare Workers pattern
-5. **Test**: Race conditions, concurrent pushes, disconnection scenarios
+1. **Reuse Cloudflare client** - Implement server-side RPC protocol, use existing client
+2. **Start with Cloudflare server** as reference for storage and validation patterns
+3. **Focus on**: Storage backend (Step 3), concurrency control (Step 3.4), broadcasting
+4. **Message format**: Use Cloudflare's message types from `sync-message-types.ts`
+5. **Cursor format**: Simple `{ backendId, eventSequenceNumber }`
+6. **Test**: Race conditions, concurrent pushes, disconnection scenarios, backendId validation
+
+**Recommended tech stack**:
+- **Runtime**: Node.js, Bun, or Deno
+- **Database**: PostgreSQL with transactions
+- **Transport**: Effect RPC over HTTP and/or WebSocket
+- **Deployment**: Fly.io, Railway, or any Node.js host
 
 ### For Custom Client Adapter
 
@@ -1061,12 +1569,46 @@ export const makeSyncBackend = (options: MyOptions): SyncBackendConstructor =>
 
 ## Conclusion
 
-Building a custom sync provider is **straightforward** if you:
+Building a custom sync provider is **significantly simpler** than it first appears, especially for full servers:
 
-1. **Reuse** the client structure (connection, errors, schemas)
-2. **Choose** an appropriate architecture (full server vs adapter)
-3. **Implement** storage and protocol-specific logic
-4. **Follow** the server-side requirements (validation, atomicity, ordering)
-5. **Test** thoroughly (race conditions, network failures, disconnections)
+### For Custom Full Servers
 
-The LiveStore sync provider interface is **well-designed** to allow diverse implementations while maintaining consistency guarantees. The existing implementations provide excellent reference patterns for both full servers and client adapters.
+The recommended approach is to **implement only the server-side**:
+
+1. **Reuse** the Cloudflare client entirely (zero client code to write!)
+2. **Implement** the Cloudflare RPC protocol server-side
+3. **Focus** on storage decisions (Step 3): head tracking, cursor queries, atomicity
+4. **Use** simple cursor format: `{ backendId, eventSequenceNumber }`
+5. **Test** thoroughly: race conditions, concurrent pushes, backendId validation
+
+**Effort breakdown**:
+- ❌ **No client code** - Reuse `makeHttpSync` or `makeWsSync`
+- ✅ **Storage layer** - Implement based on Step 3 decisions (your main work)
+- ✅ **RPC handlers** - Implement Pull, Push, Ping (straightforward with Effect RPC)
+- ✅ **Validation** - Reuse patterns from Cloudflare implementation
+
+### For Client Adapters
+
+If integrating with external services (ElectricSQL, S2, etc.):
+
+1. **Implement** the `SyncBackend` interface client-side
+2. **Reuse** connection management, error handling, retry patterns
+3. **Customize** pull/push for external service's protocol
+4. **Test** network failures, reconnection, cursor management
+
+### Key Insights
+
+The LiveStore sync provider interface is **exceptionally well-designed**:
+
+- **Separation of concerns**: Client and server can be developed independently
+- **Protocol flexibility**: HTTP RPC, WebSocket RPC, SSE, long-polling all supported
+- **Reusable components**: Connection management, validation, errors are universal
+- **Simple cursor model**: Just track position and backend ID
+- **Type safety**: Effect Schema validates all messages
+
+The **biggest simplification** for custom implementations is that **you don't need to write a client** if you implement the Cloudflare RPC protocol server-side. This reduces the work to:
+1. Storage design (choose data store, implement head tracking and cursor queries)
+2. Atomicity mechanism (choose transactions, locks, or service guarantees)
+3. RPC handlers (implement Pull, Push, Ping using your storage)
+
+The existing implementations provide excellent reference patterns, and the decision tree in this document gives you specific choices to make at each step.
