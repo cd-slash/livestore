@@ -942,6 +942,8 @@ These components are inherently provider-specific:
 
 This step involves making specific decisions about how your sync server will persist and query events.
 
+> **📖 SQLite-Specific Guidance**: If you're implementing a custom sync server with SQLite (one database per store), see the companion document [`sqlite-implementation-guide.md`](./sqlite-implementation-guide.md) for detailed answers to common questions, complete code examples, and how to reuse Cloudflare's exact schemas.
+
 #### 3.1: Choose Data Store
 
 **Options**:
@@ -1016,6 +1018,36 @@ SELECT MAX(seqNum) FROM eventlog WHERE storeId = ?
 - `backendId` (string): Prevents cross-backend pulls after migration
 - `updatedAt` (timestamp): For debugging and monitoring
 - `storeId` (string): If supporting multiple stores in one DB
+
+**What is backendId?**
+
+`backendId` is a **server-side unique identifier** that:
+- Is generated once when the server first starts: `nanoid()` (e.g., "abc123xyz")
+- Stays the same for the lifetime of your server instance
+- Is persisted in the context table alongside currentHead
+- **Prevents cross-backend pulls**: If you migrate from Server A to Server B, clients pulling with Server A's backendId will get an error, forcing them to resync
+
+**Why include backendId?**
+- ✅ **Yes, include it** - It prevents subtle bugs during server migrations
+- Cloudflare uses it, and it's minimal overhead
+- If a client has a cursor with `backendId: "old-server"` but your server has `backendId: "new-server"`, you return `BackendIdMismatchError` instead of serving potentially inconsistent data
+- Without it, a client could resume pulling from the wrong server after migration, leading to missing events or ordering issues
+
+**Initialization example**:
+```typescript
+// On server startup
+const existingContext = db.query('SELECT * FROM context_6 WHERE id = 1')[0]
+
+if (!existingContext) {
+  const backendId = nanoid()  // Generate once
+  db.run(
+    'INSERT INTO context_6 (id, currentHead, backendId) VALUES (?, ?, ?)',
+    [1, -1, backendId]  // -1 is ROOT sequence number
+  )
+}
+
+const backendId = existingContext.backendId  // Reuse on subsequent startups
+```
 
 **Decision: How to update?**
 
@@ -1157,7 +1189,7 @@ Push operations must be atomic to prevent race conditions and maintain event ord
 
 **Decision: Atomicity mechanism?**
 
-**Option A: Database transactions** (PostgreSQL, MySQL)
+**Option A: Database transactions** (PostgreSQL, MySQL, SQLite)
 ```typescript
 await db.transaction(async (tx) => {
   // 1. Read current head
@@ -1175,7 +1207,8 @@ await db.transaction(async (tx) => {
   await tx.update(context).set({ currentHead: batch[batch.length - 1].seqNum })
 })
 // Pros: Standard, well-understood, ACID guarantees
-// Cons: Requires transaction support, slower than locks
+// Cons: Requires transaction support, slower than explicit locks
+// Note: SQLite's default behavior is SERIALIZABLE isolation (strongest guarantee)
 ```
 
 **Option B: Explicit locks** (Cloudflare Durable Objects)
@@ -1250,6 +1283,7 @@ COMMIT;
 ```
 - **Pros**: Strongest guarantee, prevents all anomalies
 - **Cons**: Slowest, highest contention
+- **Note**: **SQLite always uses SERIALIZABLE** - you cannot change the isolation level
 
 **Option B: REPEATABLE READ**
 ```sql
@@ -1257,6 +1291,7 @@ SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
 ```
 - **Pros**: Prevents phantom reads, good balance
 - **Cons**: Still some contention possible
+- **Available in**: PostgreSQL, MySQL (not SQLite)
 
 **Option C: READ COMMITTED** (PostgreSQL default)
 ```sql
@@ -1264,8 +1299,11 @@ SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
 ```
 - **Pros**: Good performance, low contention
 - **Cons**: Phantom reads possible (okay for our use case with proper validation)
+- **Available in**: PostgreSQL, MySQL (not SQLite)
 
-**Recommendation**: READ COMMITTED is sufficient. Push validation (checking parentSeqNum matches currentHead) provides the necessary consistency guarantee without needing SERIALIZABLE.
+**Recommendation by database**:
+- **SQLite**: No choice needed - automatically uses SERIALIZABLE (strongest guarantee)
+- **PostgreSQL/MySQL**: READ COMMITTED is sufficient. Push validation (checking parentSeqNum matches currentHead) provides the necessary consistency guarantee without needing SERIALIZABLE.
 
 **Decision: Failure handling?**
 
@@ -1528,11 +1566,11 @@ export const makeSyncBackend = (options: MyOptions): SyncBackendConstructor =>
 | **Architecture** | Full server if need control; Adapter if using external service | Control vs convenience trade-off |
 | **Client** | Reuse Cloudflare client for full servers | No client code to write |
 | **Transport** | HTTP RPC or WebSocket RPC (for Cloudflare client) | Standard, well-tested |
-| **Storage** | SQL with transactions | ACID guarantees, queryable |
-| **Head tracking** | Separate metadata table | Robust, supports backendId |
+| **Storage** | SQL with transactions (SQLite, PostgreSQL, MySQL) | ACID guarantees, queryable |
+| **Head tracking** | Separate metadata table with backendId | Robust, prevents cross-backend pulls |
 | **Cursor queries** | Primary key on seqNum | Fastest, simplest |
 | **Atomicity** | Database transactions | Standard, reliable |
-| **Isolation** | READ COMMITTED | Good balance of performance and safety |
+| **Isolation** | SQLite: SERIALIZABLE (automatic); PostgreSQL/MySQL: READ COMMITTED | SQLite uses strongest guarantee; others: good balance |
 
 ## Key Recommendations
 
