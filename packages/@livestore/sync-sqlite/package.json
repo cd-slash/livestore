@@ -1,0 +1,36 @@
+{
+  "name": "@livestore/sync-sqlite",
+  "version": "0.4.0-dev.17",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": "./src/index.ts",
+    "./server": "./src/server/mod.ts"
+  },
+  "dependencies": {
+    "@livestore/common": "workspace:*",
+    "@livestore/sync-cf": "workspace:*",
+    "@livestore/utils": "workspace:*",
+    "better-sqlite3": "^12.4.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12"
+  },
+  "files": [
+    "dist",
+    "src",
+    "package.json",
+    "README.md"
+  ],
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      ".": "./dist/index.js",
+      "./server": "./dist/server/mod.js"
+    }
+  },
+  "scripts": {
+    "test": "vitest"
+  }
+}
