@@ -155,7 +155,6 @@ PRAGMA busy_timeout = 5000;       -- Wait up to 5s for locks
 
 ### Current
 
-- ⚠️ **WebSocket RPC integration**: Initial implementation, being refined
 - ❌ **No clustering**: Single server instance per database
 - ❌ **No replication**: No built-in primary/replica setup
 
